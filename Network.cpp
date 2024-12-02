@@ -7,16 +7,29 @@
 #include <unistd.h>
 #include <cstring>
 #include <fcntl.h>
+#include "SendData.h" // Pro funkci sendData
+#include <stdexcept>
+#include <sys/epoll.h>
+#include <thread>
+#include <functional>
+#include <vector>
 
 #define MAX_EVENTS 1000
 #define WORKER_THREADS 4
-#define BUFFER_SIZE 1024
+#define BUFFER_SIZE 4096
 
 Network::Network(int server_port)
     : server_port(server_port), server_fd(-1), epoll_fd(-1)
 {
+    epoll_fd = epoll_create1(0);
+    if (epoll_fd == -1) 
+    {
+        std::cerr << "Failed to create epoll file descriptor." << std::endl;
+        exit(EXIT_FAILURE);
+    }
+
     // Vytvoøení socketu serveru
-    server_fd = socket(AF_INET, SOCK_STREAM | SOCK_NONBLOCK, IPPROTO_TCP);
+    server_fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (server_fd < 0) 
     {
         std::cerr << "Failed to create server socket." << std::endl;
@@ -27,7 +40,12 @@ Network::Network(int server_port)
     {
         std::cerr << "Invalid port number." << std::endl;
         exit(EXIT_FAILURE);
-    }
+    }         
+
+
+    int flags = fcntl(server_fd, F_GETFL, 0);
+    fcntl(server_fd, F_SETFL, flags | O_NONBLOCK); // Non-blocking socket
+
 
     int opt = 1;
     if (setsockopt(server_fd, SOL_SOCKET, SO_REUSEADDR, (char*)&opt, sizeof(opt)) < 0x0)
@@ -59,13 +77,13 @@ Network::Network(int server_port)
     }
 
     // Vytvoøení epoll instance
-    epoll_fd = epoll_create1(0);
-    if (epoll_fd < 0) 
-    {
-        std::cerr << "Failed to create epoll instance." << std::endl;
-        close(server_fd);
-        exit(EXIT_FAILURE);
-    }
+    //epoll_fd = epoll_create1(0);
+    //if (epoll_fd < 0) 
+    //{
+    //    std::cerr << "Failed to create epoll instance." << std::endl;
+    //    close(server_fd);
+    //    exit(EXIT_FAILURE);
+    //}
 
     struct epoll_event event {};
     event.data.fd = server_fd;
@@ -88,16 +106,9 @@ Network::~Network()
 
 void Network::startServer()
 {
-    // Spustíme vlákna pro zpracování epoll událostí
-    for (int i = 0; i < WORKER_THREADS; ++i) 
-    {
-        worker_threads.emplace_back(&Network::workerLoop, this);
-    }
+    worker_threads.emplace_back(&Network::workerLoop, this); // Spuštìní vlákna pro správu pøipojení
 
-    for (auto& thread : worker_threads) 
-    {
-        thread.join();
-    }
+    std::cout << "Server started on port " << server_port << std::endl;
 }
 
 void Network::stopServer() 
@@ -119,27 +130,68 @@ void Network::stopServer()
     }
 }
 
+void Network::sendPacket(const PacketBase& packet, int client_socket)
+{
+    // Serializace paketu
+    std::vector<uint8_t> serialized_data;
+    Serialize::serialize(packet, serialized_data);
+
+    // Kontrola velikosti serializovaných dat
+    if (serialized_data.size() > static_cast<size_t>(INT_MAX))
+    {
+        std::cerr << "Serialized data length exceeds allowed size." << std::endl;
+        return;
+    }
+
+    // Získání zámku, aby se zabránilo konkurenènímu pøístupu ke klientské mapì
+    std::lock_guard<std::mutex> lock(client_mutex);
+
+    auto it = client_sessions.find(client_socket);
+    if (it != client_sessions.end())
+    {
+        ssize_t bytes_sent = send(client_socket, reinterpret_cast<const char*>(serialized_data.data()), static_cast<int>(serialized_data.size()), 0);
+
+        if (bytes_sent < 0)
+        {
+            std::cerr << "Failed to send packet to client socket " << client_socket << ": " << strerror(errno) << std::endl;
+        }
+        else
+        {
+            std::cout << "Sent packet of type: " << static_cast<int>(packet.getPacketType()) << " to client socket " << client_socket << ", bytes sent: " << bytes_sent << std::endl;
+        }
+    }
+    else
+    {
+        std::cerr << "Client socket " << client_socket << " not found." << std::endl;
+    }
+
+}
+
+std::vector<int> Network::getClientSockets()
+{
+    std::lock_guard<std::mutex> lock(client_mutex);
+    std::vector<int> client_sockets;
+    for (const auto& pair : client_sessions)
+    {
+        client_sockets.push_back(pair.first);
+    }
+    return client_sockets;
+}
+
+// Pracovní vlákno, které spravuje epoll události
 void Network::workerLoop() 
 {
+    //const int MAX_EVENTS = 10;
     epoll_event events[MAX_EVENTS];
 
-    while (true) 
-    {
-        int n = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
-        if (n < 0) 
-        {
-            std::cerr << "epoll_wait failed." << std::endl;
-            break;
-        }
+    while (true) {
+        int num_events = epoll_wait(epoll_fd, events, MAX_EVENTS, -1);
 
-        for (int i = 0; i < n; ++i) 
-        {
-            if (events[i].data.fd == server_fd) 
-            {
+        for (int i = 0; i < num_events; ++i) {
+            if (events[i].data.fd == server_fd) {
                 handleNewConnection();
             }
-            else 
-            {
+            else {
                 handleClient(events[i].data.fd);
             }
         }
@@ -169,78 +221,130 @@ void Network::handleNewConnection()
     }
 
     std::lock_guard<std::mutex> lock(client_mutex);
-    client_data[client_socket] = nullptr; // Inicializace dat pro klienta
+    client_sessions[client_socket] = std::make_shared<ClientSession>(client_socket); // Vytvoøení nové session pro klienta
+
+    std::cout << "New client connected, socket: " << client_socket << std::endl;
+
 }
 
-void Network::handleClient(int client_socket) 
+// Zpracování pøijatých dat od klienta
+void Network::handleClient(int client_socket)
 {
-    uint8_t buffer[BUFFER_SIZE];
-    int bytes_read = read(client_socket, reinterpret_cast<char*>(buffer), static_cast<int>(sizeof(buffer)));
+    auto it = client_sessions.find(client_socket);
+    if (it == client_sessions.end())
+    {
+        std::cerr << "Client session not found for socket " << client_socket << std::endl;
+        closeClient(client_socket);
+        return;
+    }
 
-    if (bytes_read <= 0) 
+    ClientSession& session = *(it->second);
+    uint8_t buffer[BUFFER_SIZE];
+    ssize_t bytes_read = recv(client_socket, buffer, sizeof(buffer), 0);
+
+    if (bytes_read <= 0)
     {
         closeClient(client_socket);
         return;
     }
 
-    try
-    {
-        std::shared_ptr<PacketBase> packet = Serialize::deserialize(buffer, bytes_read);
+    // Pøidání pøijatých dat do bufferu klientské session
+    session.addToBuffer(std::vector<uint8_t>(buffer, buffer + bytes_read));
 
-        switch (packet->getPacketType()) 
-        {
-        case PacketType::LOGIN: 
-        {
-            auto login_packet = std::static_pointer_cast<LoginPacket>(packet);
-            std::cout << "Received login packet with account ID: " << login_packet->account_id << std::endl;
-            break;
-        }
-        case PacketType::LOGINPWD:
-        {
-            auto login_packet_pwd = std::static_pointer_cast<LoginPacketPWD>(packet);
-            std::cout << "Recived login packet with account password: " << login_packet_pwd->password << std::endl;
-            break;
-        }
-        case PacketType::MESSAGE: 
-        {
-            auto message_packet = std::static_pointer_cast<MessagePacket>(packet);
-            std::cout << "Received message: " << message_packet->message << std::endl;
-            break;
-        }
-        case PacketType::DATA:
-        {
-            auto data_packet = std::static_pointer_cast<DataPacket>(packet);
-            std::cout << "Received data: " << std::string(data_packet->data.begin(), data_packet->data.end()) << std::endl;
-            std::cout << "Received data_as_string: " << data_packet->data_as_string << std::endl;
-            break;
-        }
-        case PacketType::TEST:
-        {
-            auto test_packet = std::static_pointer_cast<TestPacket>(packet);
-            std::cout << "Received test string: " << test_packet->test_string << std::endl;
-            std::cout << "Received test vector: ";
-            for (int value : test_packet->test_vector)
-            {
-                std::cout << value << " ";
-            }
-            std::cout << std::endl;
-            break;
-        }
-        // Další typy paketù...
-        default:
-            std::cerr << "Unknown packet type received." << std::endl;
-            break;
-        }
-    }
-    catch (const std::exception& e) 
+    std::vector<uint8_t>& client_buffer = session.getBuffer();
+
+    while (client_buffer.size() >= 8) // Minimální velikost: 4 bajty typ + 4 bajty délka
     {
-        std::cerr << "Failed to deserialize packet: " << e.what() << std::endl;
+        // Získání typu paketu a délky (prvních 8 bajtù)
+        PacketType packet_type = static_cast<PacketType>((client_buffer[0] << 24) | (client_buffer[1] << 16) | (client_buffer[2] << 8) | client_buffer[3]);
+        size_t packet_length = (client_buffer[4] << 24) | (client_buffer[5] << 16) | (client_buffer[6] << 8) | client_buffer[7];
+        size_t total_packet_length = 8 + packet_length;
+
+        // Zkontrolujte, zda máme dostatek dat pro kompletní paket
+        if (client_buffer.size() < total_packet_length) {
+            // Poèkejte na další data, protože paket není kompletní
+            break;
+        }
+
+        // Pokud máme kompletní paket, zpracujeme ho
+        try
+        {
+            // Vytvoøte ukazatel na deserializovaný paket
+            std::shared_ptr<PacketBase> packet = Serialize::deserialize(client_buffer.data(), total_packet_length);
+
+            // Výpis zpracovaných dat pro ladìní
+            std::cout << "Processed raw data for packet type: ";
+            for (size_t i = 0; i < total_packet_length; ++i) {
+                std::cout << std::hex << static_cast<int>(client_buffer[i]) << " ";
+            }
+            std::cout << std::dec << std::endl;
+
+            // Zpracujte paket podle jeho typu
+            switch (packet->getPacketType())
+            {
+            case PacketType::LOGIN:
+            {
+                auto login_packet = std::static_pointer_cast<LoginPacket>(packet);
+                std::cout << "Received login ID: " << login_packet->account_id << std::endl;
+                break;
+            }
+            case PacketType::LOGINPWD:
+            {
+                auto login_packet_pwd = std::static_pointer_cast<LoginPacketPWD>(packet);
+                std::cout << "Received login password: " << login_packet_pwd->password << std::endl;
+                break;
+            }
+            case PacketType::MESSAGE:
+            {
+                auto message_packet = std::static_pointer_cast<MessagePacket>(packet);
+                std::cout << "Received message: " << message_packet->message << std::endl;
+
+                if (message_packet->message.find("POZDRAV") != std::string::npos)
+                {
+                    MessagePacket response_packet;
+                    response_packet.message = "Hello, tady server.";
+                    sendPacket(response_packet, client_socket); // Odeslání odpovìdi konkrétnímu klientovi
+                    std::cout << "Sent response to client " << client_socket << ": " << response_packet.message << std::endl;
+
+                }
+
+
+
+                break;
+            }
+            default:
+                std::cerr << "Unknown packet type received." << std::endl;
+                break;
+            }
+
+            // Odstraòte kompletnì zpracovaný paket z bufferu
+            client_buffer.erase(client_buffer.begin(), client_buffer.begin() + total_packet_length);
+        }
+        catch (const std::exception& e)
+        {
+            std::cerr << "Failed to deserialize packet: " << e.what() << std::endl;
+            client_buffer.clear(); // Vyèistìte buffer pøi kritické chybì
+            return;
+        }
+
+        // Výpis zbývajících dat po vymazání z bufferu
+        if (!client_buffer.empty()) {
+            std::cout << "Remaining data in buffer after erasing: ";
+            for (auto b : client_buffer) {
+                std::cout << std::hex << static_cast<int>(b) << " ";
+            }
+            std::cout << std::dec << std::endl;
+        }
     }
 }
 
-void Network::closeClient(int client_socket) 
+// Uzavøení pøipojení a odstranìní session
+void Network::closeClient(int client_socket)
 {
     std::lock_guard<std::mutex> lock(client_mutex);
-    client_data.erase(client_socket);
+    client_sessions.erase(client_socket);
     close(client_socket);
+
+    std::cout << "Client socket " << client_socket << " closed." << std::endl;
 }
+

@@ -1,6 +1,10 @@
 #include <iostream>
+#include <thread>
+#include <chrono>
 #include "Network.h"
 #include "Packet.h"
+#include "SendData.h"
+#include "ReadData.h"
 
 
 // Tutoriál: Jak pøidat nový paket do systému
@@ -18,58 +22,32 @@
 // do funkce Network::handleClient(). Pomocí deserializace pøeètìte data a následnì zpracujte obsah podle logiky vašeho programu.
 
 
-//int main(int argc, char* argv[])
-//{
-//    // Initialize the network client
-//    Network client("192.168.56.1", 13000);
-//    client.connect();
-//
-//    // Create a packet to send
-//    LoginPacket packet;
-//    packet.account_id = 12345;
-//    packet.password = "password123";
-//
-//    // Send the packet
-//    client.sendPacket(packet);
-//
-//    // Create and send a message packet
-//    MessagePacket message_packet;
-//    message_packet.message = "Ahoj svete";
-//    client.sendPacket(message_packet);
-//
-//    //std::vector<uint8_t> screenshot_data = takeScreenshot();  // Funkce pro získání screenshotu
-//    //ScreenPacket screen_packet;
-//    //screen_packet.screen_data = screenshot_data;
-//    //client.sendPacket(screen_packet);
-//
-//    // Create and send a data packet
-//    DataPacket data_packet;
-//    data_packet.data = { 'H', 'e', 'l', 'l', 'o' };
-//    data_packet.data_as_string = "Hello";
-//    client.sendPacket(data_packet);
-//
-//    // Create and send a test packet
-//    TestPacket test_packet;
-//    test_packet.test_string = "Test string";
-//    test_packet.test_vector = { 1, 2, 3, 4, 5 };
-//    client.sendPacket(test_packet);
-//
-//    // Process incoming packets (this could be done in a loop (while) if needed)
-//    client.processIncomingPackets();
-//
-//
-//
-//    return 0;
-//
-//}
-//
+// Funkce pro odesílání zpráv konkrétnímu klientovi
+void sendMessageToClient(Network& server, int client_socket, const std::string& message)
+{
+    MessagePacket message_packet;
+    message_packet.message = message;
 
+    // Odeslání paketu konkrétnímu klientovi
+    server.sendPacket(message_packet, client_socket);
+    std::cout << "Message packet sent to client socket " << client_socket << ": " << message << std::endl;
+}
 
 int main()
 {
-    Network server(13000);
-    server.startServer();
+    // 1. Inicializace serveru a spuštìní
+    Network server(13000);  // Vytvoøíme server naslouchající na portu 13000
+    server.startServer();   // Spustíme server, aby zaèal pøijímat pøipojení klientù
+
+    std::cout << "Server is running and waiting for clients..." << std::endl;
+
+    // 2. Zatímco server bìží, mùžeme mu dynamicky posílat zprávy pøipojeným klientùm
+    while (true)
+    {
+        // Poèkáme chvíli, abychom simulovali serverový chod (napøíklad pøijímání nových klientù)
+        std::this_thread::sleep_for(std::chrono::seconds(10));   // Server mùže dìlat další úkony mezi èekáním na pøipojení
+
+    }
 
     return 0;
 }
-
